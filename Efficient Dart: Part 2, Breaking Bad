@@ -1,0 +1,605 @@
+A story that started with [Flutter frame rates optimisations](https://dev.to/maximsaplin/efficient-dart-optimizing-cpu-bound-load-in-flutter-without-missing-a-frame-5dme), turned quite competitive... With a few turns and twists:
+
+- CPU-bound microbenchmark created in Python/Numba and [compared](https://dev.to/maximsaplin/mojo-head-to-head-with-python-and-numba-5bn9) to Mojo🔥
+- Then extended to a total of **10 programming languages** 
+- and tested in [26 different configurations](https://github.com/maxim-saplin/mandelbrot).
+- Going head-to-head with a friend of mine, determining [who's Kung-Fu is better](https://github.com/maxim-saplin/mandelbrot/blob/main/_optimized/csharp/Program.cs). 
+- Finding out that [SIMD is broken in Dart](https://github.com/dart-lang/sdk/issues/53662). 
+- And achieving a **3200% speed-up** of what seemed to be already an efficient implementation.
+
+The story is almost a thriller. At one moment you think "that's it, I'm done, no way forward". And next you make a jump, adding 50, 100, 500%...
+
+## Episode 1. Mandelbrot in Dart
+
+You can read what Mandelbrot set is on Wikipedia. It is a concept, smimilar to Julia set used in [Efficient Dart, Part 1](https://dev.to/maximsaplin/efficient-dart-optimizing-cpu-bound-load-in-flutter-without-missing-a-frame-5dme).
+
+Though, what we care about here is not fractal geometry and complex number math.. Escape algorithm for Mandelbrot is a CPU-bound task that can be easily expressed in any programming language. It utilises integer and floating point types, parallelizable, can stress CPU - and be representative of compute performance.
+
+While [investigating Mojo🔥](https://dev.to/maximsaplin/mojo-head-to-head-with-python-and-numba-5bn9) I used Mandelbrot to compare its' performance to Python and Numba. Here're the timings I received:
+
+| Variant                           | Seconds |
+|-----------------------------------|---------|
+| Python + NumPy                    | 10,8    |
+| Python + NumPy + Numba (fastmath) | 0,64    |
+| Mojo🔥                            | 0,32    |
+
+
+Out of curiosity I have added Dart implementation. After all, that's just a single file that runs the calculation and reports it back to console. Easy.
+
+Here's [the Dart version](https://github.com/maxim-saplin/mandelbrot/blob/main/mandelbrot.dart) of Mandelbrot set generation. The core of the calculation are the below 2 functions:
+
+```dart
+int mandelbrot_0(Complex c) {
+  Complex z = c;
+  int nv = 0;
+  for (int i = 1; i < MAX_ITERS; i++) {
+    if (z.abs() > 2) {
+      break;
+    }
+    z = z * z + c;
+    nv += 1;
+  }
+  return nv;
+}
+
+Uint32List mandelbrot() {
+  var output = Uint32List(width * height);
+  for (int h = 0; h < height; h++) {
+    double cy = min_y + h * scaley;
+    for (int w = 0; w < width; w++) {
+      double cx = min_x + w * scalex;
+      output[h * width + w] = mandelbrot_0(Complex(cx, cy));
+    }
+  }
+  return output;
+}
+```
+
+There're 3 loops with multiplications, additions and comparisons inside. The two outer loops enumerate each point and use the 3rd loop to test if the point belongs to the set or not - it is where the `escape` happens (hence the name of the algorithm). With so many nested loops and some computations happening there it is no surprise that Mandelbrot is not an easy computation task. There's also a `Complex` class defined that abstracts complex number operations required.
+
+First try, let's run the code:
+```bash
+dart mandelbrot.dart
+```
+
+And here's the output:
+```shell
+user@user-virtual-machine:~/Documents/src/mandelbrot$ dart mandelbrot.dart 
+1  Execution Time: 0.635                       78513425
+2  Execution Time: 0.612                       78513425
+3  Execution Time: 0.645                       78513425
+```
+
+The above command used Dart VM and JIT. Though there's Ahead-of-Time compiler (the one used to build Flutter release apps). Can we gain any improvements without changing a line of code?
+
+```bash
+user@user-virtual-machine:~/Documents/src/mandelbrot$ dart compile exe mandelbrot.dart 
+Generated: /home/user/Documents/src/mandelbrot/mandelbrot.exe
+user@user-virtual-machine:~/Documents/src/mandelbrot$ ./mandelbrot.exe
+1  Execution Time: 0.47                       78513425
+2  Execution Time: 0.42                       78513425
+3  Execution Time: 0.42                       78513425
+```
+
+Not bad, right? Dart is fast out of the box in both JIT and AoT modes, very close to Mojo. Here're side by side results:
+
+| Variant                           | Seconds |
+|-----------------------------------|---------|
+| Python + NumPy                    | 10,8    |
+| Python + NumPy + Numba (fastmath) | 0,64    |
+| **Dart VM/JIT**                   | **0,64**|
+| **Dart AoT**                      | **0,42**|
+| Mojo🔥                            | 0,32    |
+
+Btw, while I code on Apple Silicon MacBook, for the benchmarks I used a 2019 13" MacBook Pro with Intel® Core™ i5-8257U CPU @ 1.40GHz, running Windows 11 as bootcamp, with Ubuntu 20.04, VMWare and 2 cores available for the VM. That's the baseline config. Why? Cause Mojo SDK is only available for Linux. Running ARM and Intel configs side-by-side will give quite a few interesting findings.
+
+## Episode 2. Obsessed with Benchmarks
+
+Was it taste of discovery or manifestation of OCD.. Yet armed with GPT 3.5 API Key and [cptX AI Assistant](https://marketplace.visualstudio.com/items?itemName=MaximSaplin.cptx) I went on repeating the experiment with other languages:
+
+![Creating Java version](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/6tqc4njmtkcfqqnu6vu6.gif)
+
+Python, Mojo🔥, Dart, JavaScript, Java, Kotlin, Go, C, Rust... A friend of mine contributed C#. 10 languages in total. Test all with different runtimes, compiler options, tested how minor alteration to code played out - a total of [26 data points](https://github.com/maxim-saplin/mandelbrot/blob/main/README.md) received from the same hardware and Ubuntu VM.
+
+My takeaways from this exercise were:
+- Python is super slow out of the box, and it is super-mega-hyper slow when you have classes instantiated in a loop
+- JavaScript is surprisingly fast and not far from compiled languages! Expected it to be in Python league, the second interpreted language from the pack
+- Floating point math is tricky. Even same also with same precision floating point types can produce slightly different results. I.e. I used a check sum (total of all pixels) and it varied slightly.
+- Most of the compiled languages showed quite close results in a range of 0.3 - 0.6 seconds
+
+Here're the best results for each of the languages:
+
+| Language                   | Time (seconds) |
+|----------------------------|----------------|
+| Python + NumPy             | 10,8           |
+| JavaScript + Node          | 0,82           |
+| Kotlin + custom Complex    | 0,6            |
+| Java + custom Complex      | 0,5            |
+| Dart + cust Complex (AoT)  | 0,42           |
+| Go + custom Complex64      | 0,35           |
+| C# + custom Complex (AoT)  | 0,33           |
+| Rust + custom Complex      | 0,32           |
+| Mojo                       | 0,32           |
+| gcc (-Ofast)               | 0,29           |
+
+## Episode 3. "_optimized/" folder
+
+It didn't take long for the competition to kick off:
+\- I have a feeling my Dart will show you C# a way out.
+\- Well, I don't think so...
+
+I took on accelerating the baseline Dart version, while a friend of mine took on optimising C#.
+
+I started with removing the `Complex` number and working directly on individual coordinates. This saves time on instantiating complex numbers and supposedly some time on field access. Then I've moved calculations around in the inner loop remove excessive operations, also skipped the square root operation.
+
+This baseline:
+
+```dart
+//V1
+int mandelbrot_0(Complex c) {
+  Complex z = c;
+  int nv = 0;
+  for (int i = 1; i < MAX_ITERS; i++) {
+    if (z.abs() > 2) {
+      break;
+    }
+    z = z * z + c;
+    nv += 1;
+  }
+  return nv;
+}
+```
+
+Turned into this:
+
+```dart
+// V2
+int mandelbrot_0(double cx, double cy) {
+  var zx = cx, zy = cy;
+  int nv = 0;
+  for (nv; nv < MAX_ITERS - 1; nv++) {
+    final zzx = zx * zx;
+    final zzy = zy * zy;
+    if (zzx + zzy > 4) {
+      break;
+    }
+    double new_zx = zzx - zzy + cx;
+    zy = 2 * zx * zy + cy;
+    zx = new_zx;
+  }
+  return nv;
+}
+```
+
+I've also changed the measurement protocol. Now there're 11 iterations, the 1st is a warm-up one and discarded, for the rest average and standard deviation is calculated. Still there was some fluctuation from run to run and I did 3-5 runs and picked the 2nd best of all.
+
+OK, here're the results (running compiled AoT binaries): 
+
+v1) Avg: 478.0ms, StdDev: 0.4626%, SUM 78513425
+v2) Avg: 295.6ms, StdDev: 0.9856%, SUM 78513425
+
+And what about .NET?
+
+## Episode 4. Here comes the SIMD
+
+Right away the C# version employed SIMD and decreased precision using 32-bit `float` type.
+
+Here're the C# results, ~5x improvement over the baseline.
+
+- V1) Avg: 330.0ms - original
+- V2) Avg: 58.33ms, StdDev: 5.00%, SUM 78516973
+
+Not looking good for Dart...
+
+![C# vs Dart](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/72tit1eqj1bc1zma8xiq.png)
+
+> Side note. Dart developers don't have the liberty of picking numerical types. In C# there're 10 integral and 3 floating-point types. In Dart you get 64-bit `int` and 64-bit `double` and there's no way to search performance gains playing with signed/unsigned and type sizes.
+
+Luckily, there's SIMD support in Dart. Yet before appealing to this 100% option (as I thought at the moment) I tried squeezing more out of the existing code (moving things around), with little success:
+
+- V3) Precompute Cx, 302.1ms
+- V4) Loop Unroll, 303.5ms
+
+### Dart SIMD
+
+OK, time to vectorise and leverage Single Instruction/Multiple Data in Dart. There're special types in [dart:typed_data](https://api.dart.dev/stable/3.1.3/dart-typed_data/dart-typed_data-library.html) library that provide the necessary APIs: `Int32x4`, `Float32x2`, `Float64x2`. In essence these types give access to 128-bit vector operations that can pack 2 or 4 values, supports ARM's Neon and x86 SSE.
+
+> Unlike .NET, SIMD support in Dart is very basic, there're only 128-bit vectors with minimal set of operations. With C# there're plenty of instruction sets with large vectors up to 512-bit. 
+
+I've approached this task with GPT4, twice :) And none of the attempts succeeded, the produced code either didn't compile OR resulted in infinite loops.
+
+Thinking in vectors and writing code working on multiple values at the time is no easy task. Yet in my 3rd attempt I ended up with the [following version](https://github.com/maxim-saplin/mandelbrot/blob/main/_optimized/mandelbrot.dart):
+
+```dart
+Uint8List mandelbrot() {
+  var output = Uint8List(width * height);
+  final escapeThreshold = Float32x4(4.0, 4.0, 4.0, 4.0);
+
+  for (int h = 0; h < height; h++) {
+    double cy = min_y + h * scaley;
+    Float32x4 cy4 = Float32x4.splat(cy);
+
+    for (int w = 0; w < width; w += 4) {
+      Float32x4 cxx4 = Float32x4(min_x + w * scalex, min_x + (w + 1) * scalex,
+          min_x + (w + 2) * scalex, min_x + (w + 3) * scalex);
+      Float32x4 zx = cxx4;
+      Float32x4 zy = cy4;
+      Int32x4 nv4 = Int32x4(0, 0, 0, 0);
+      int mask = 1;
+      var iter = 2;
+
+      while (mask > 0) {
+        Float32x4 zzx = zx * zx;
+        Float32x4 zzy = zy * zy;
+
+        Float32x4 new_zx = (zzx - zzy) + cxx4;
+        zy = (zx * zy) + (zx * zy) + cy4;
+        zx = new_zx;
+
+        var sum = zzx + zzy;
+
+        Int32x4 breakCondition = (escapeThreshold).greaterThan(sum);
+        nv4 += breakCondition & Int32x4(1, 1, 1, 1);
+
+        iter++;
+        if (iter > MAX_ITERS) {
+          break;
+        }
+        mask = breakCondition.signMask;
+      }
+
+      output[h * width + w] = nv4.x;
+      output[h * width + w + 1] = nv4.y;
+      output[h * width + w + 2] = nv4.z;
+      output[h * width + w + 3] = nv4.w;
+    }
+  }
+
+  return output;
+}
+``` 
+
+Few comments on how it works. Like the original implementation the outer loop is iterating lines and inner iterates pixels. Though in this case we're working on 4 pixels (coordinate pairs) at once via `Float32x4`. In the inner-most loop we do the calculation for each of the 4-points and complete the loop when the very last point (of the 4) surpasses the `MAX_ITERS` and escapes.
+
+One more remark. The code above assumes that `width` must be divisible by 4 and if it happens to be different width the code will break.
+
+With so many changes it is easy to get lost in code and make it buggy. To make sure that it is OK and keeps producing the right result I used a simple technique - verified that the total sum of all elements returned by `mandelbrot` is close to a known value of 78513425:
+
+```dart
+    result = mandelbrot();
+...
+    int sum = result.reduce((value, element) => value + element);
+```
+
+Due to different precision of types, order of operations, floating-point rounding it is OK for the sum to fluctuate. For this exercise it was assumed that ±1% (77728291 ~ 79298559) is acceptable.
+
+OK. The code is ready. **Time to run it!** Quick check in VM via `dart mandelbrot.dart` gives very promising result! 
+```
+Avg: 162.9ms, StdDev: 7.5598%
+```
+\- **almost double the performance of previous best result!**
+
+Yet upon checking the sum comes the disappointment:
+
+```
+87667671
+```
+\- it is 12% off :(
+
+OK... Let's try it in AoT mode by compiling it via `dart compile exe`?
+
+Here's another surprise:
+
+```
+Avg: 8806.0ms, StdDev: 4.4871%, sum 78513692
+```
+Now the check sum looks OK, yet the performance is **30 times slower**!
+
+<h2> Episode 5. The Unreachable C# </h2>
+
+Am I the only one who used SIMD in Dart in years? I double checked code, researched the subject and ended up filing an [issue](https://github.com/dart-lang/sdk/issues/53662) at GitHub. Turns our the problem is in not my code but Dart :(
+
+With SIMD not available in Dart the task of breaking the 5x gap between Dart's best 296ms and 58ms in C# doesn't look realistic.
+
+The logical next step was going parallel. Luckily the escape algorithm is perfectly parallelizbale - each individual point can be processed independently from others. In our case we can give each thread one line OR we can split the area in horizontal stripes (multiple adjacent lines) and have them calculated in parallel.
+
+Though the situation still doesn't look good for Dart... 
+
+There're no threads with shared memory in Dart. You can't have parallel workers mutating same array in the memory. With Dart you must use isolates that will be working on their own parts which then will be copied to the main isolate and merged there into a single resulting collection. Besides this memory copy/paste overhead Dart has communication overhead, you have to use event based APIs which add up extra work (though this seems like smaller problem as there's just one call to isolate passing in few input params).
+
+
+And .NET hadn't employed parallelization yet. With C# there're no challenges with threads in shared memory, those are available to developers.
+
+## Episode 6. Parallel Dart
+
+My first attempt was to ask [cptX/GPT4](https://marketplace.visualstudio.com/items?itemName=MaximSaplin.cptx) to take the optimised single threaded Dart version and split it to work in 2 isolates. Why 2? The VM had 2 cores. Right away I received a version with little changes made yet compilable and runnable:
+
+```dart
+Future<Uint8List> spawnIsolates() async {
+  final response = Completer<Uint8List>();
+  final receivePort = ReceivePort();
+  final isolateData1 = IsolateData(receivePort.sendPort, 0, height ~/ 2);
+  final isolateData2 = IsolateData(receivePort.sendPort, height ~/ 2, height);
+
+  await Isolate.spawn(mandelbrot, isolateData1);
+  await Isolate.spawn(mandelbrot, isolateData2);
+
+  final results = await receivePort.take(2).toList();
+
+  response.complete(Uint8List.fromList([...results[0], ...results[1]]));
+  return response.future;
+}
+
+void main() async {
+...
+  for (int i = -1; i < iterations; i++) {
+...
+    result = await spawnIsolates();
+...
+```
+
+And it performed better, though not significantly. A mere 10ms addition to previous best, not great:
+
+```
+Avg: 288.0ms, StdDev: 12.1533%, sum 78514525
+```
+
+One apparent slowdown to fix is spawning isolates. It happens lazily inside the function that is being timed. Let's refactor our code and have 2 isolates started before scheduling any processing with them. Here's a piece of code that solves that (which I am not proud of cause it's ugly):
+
+
+```dart
+...
+late Isolate i1, i2;
+late ReceivePort mainIsolatPort1, mainIsolatPort2;
+
+Future<(SendPort, SendPort, Stream, Stream)> spawnIsolates() async {
+  mainIsolatPort1 = ReceivePort();
+  mainIsolatPort2 = ReceivePort();
+
+  i1 = await Isolate.spawn<SendPort>(isolateBody, mainIsolatPort1.sendPort);
+  i2 = await Isolate.spawn<SendPort>(isolateBody, mainIsolatPort2.sendPort);
+
+  var r1 = mainIsolatPort1.asBroadcastStream();
+  var r2 = mainIsolatPort2.asBroadcastStream();
+
+  var p1 = await r1.first as SendPort;
+  var p2 = await r2.first as SendPort;
+
+  return (p1, p2, r1, r2);
+}
+
+...
+
+void main() async {
+  ...
+  var (send1, send2, receive1, receive2) = await spawnIsolates();
+  final isolateData1 = MandelbrotRequest(0, height ~/ 2);
+  final isolateData2 = MandelbrotRequest(height ~/ 2, height);
+  for (int i = -1; i < iterations; i++) {
+    stdout.write('${i + 1}\t ');
+    DateTime start_time = DateTime.now();
+
+    send1.send(isolateData1);
+    send2.send(isolateData2);
+
+    var futures = [receive1.first, receive2.first];
+
+    var results = await Future.wait(futures);
+
+    var b = BytesBuilder(copy: false);
+    b.add(results[0]);
+    b.add(results[1]);
+    result = b.toBytes();
+```
+
+And here're the results:
+
+![Parallel V2](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/wsb0wlmsbh3yif35d7jg.png)
+
+## Episode 7. Going Smart
+
+Time to change the approach. After few head-on attacks on the task I managed to get marginal improvements still being 4x behind C#.
+
+Taking pause I had this aha moment. In engineering and TRIZ they say "the best part is no part. In Lean/Kanban it is "the best job is job not done".
+
+If we look closely at Mandelbrot set we can notice that is symmetrical along horizontal axis. Why not cut the amount of processing in half?
+
+![Mandelbrot set rendered](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/8u78viqyepqttxqlzg26.png)
+
+What I did was split the area in 4 vertical stripes, have the upper 2 processed separately by isolates and mirrored:
+
+```dart
+List<Uint8List> mandelbrot(int start, int end) {
+  ...
+  Uint8List mirror = Uint8List(output.length);
+  int hght = (output.length / width).floor();
+  for (int h = 0; h < hght; h++) {
+    for (int w = 0; w < width; w++) {
+      mirror[(hght - h - 1) * width + w] = output[h * width + w];
+    }
+  }
+
+  return [output, mirror];
+}
+```
+
+And the result is much better:
+```
+Avg: 149.4ms, StdDev: 6.6949%, SUM 78277544
+```
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/dd6w3imb39xd4ekr8lqw.png)
+
+<h2> Episode 8. Unreachable C# </h2>
+
+By this time C# version has employed multi-threading, used the same optimisation technique exploiting symmetry and mirroring produced array. While multi-threading didn't give much impact (surprisingly), the result for C# significantly improved and the gap with Dart increased:
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/zp6rpeadupysso6gypmd.png)
+
+## Episode 9. Desperate to Win
+
+At this point I took a pause to contemplate and wait for any new ideas to pop up in my head.
+
+One of the ideas was to review what kind of values I get in the resulting array. `const int MAX_ITERS = 256;` is not changed and it determines the number of iteration in the inner-most loop. The resulting array will have values in range 0..255. I've built a histogram counting frequencies of each value in the result produced by algo run:
+
+```dart
+// 255,     Frequency: 27.53%
+// 2,       Frequency: 21.28%
+// 3,       Frequency: 12.40%
+// 4,       Frequency: 7.50%
+// 5,       Frequency: 4.77%
+// 0,       Frequency: 4.51%
+// 1,       Frequency: 4.02%
+...
+```
+
+It took some time for me to realise that the most frequent value is 255 and it is produced in cases when most CPU cycles are spent awaiting for point to escape and reach the `MAX_ITERS`. Those are the points that belong to the set, the dark point in the below picture:
+
+![Mandelbrot set plotted](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/seigo2eou9rnjpqxmj9d.png)
+
+And if I changed the `MAX_ITERS` to lower value, say from 256 to 16, right away I received timings close to 1ms. Why not apply the same principle with skipping work that can be skipped?
+
+Let's call the regions that definitely belong to Mandelbrot set a well-known region. And let's add an `if` statement that checks for the current pixel/point belonging to a well know region. If it belongs we automatically assign this pixel a value of `MAX_ITERS` and skip the whole 3rd loop. We can easily find rectangles that are 'well-known to be Mandelbrot' and check for coordinates being inside them: 
+
+```dart
+List<Uint8List> mandelbrot(int start, int end) {
+  ...
+  for (int h = start; h < end; h++) {
+    final double cy = min_y + h * scaley;
+
+    for (int w = 0; w < width; w++) {
+      final double cx = cxx[w];
+      int nv = 0;
+      double zx = cx, zy = cy;
+
+      // Skipping calculation for known to be madelbrot area
+      if ((cx > -1.17 && cx < -0.83 && cy > -0.18) ||
+          (cx > -0.55 && cx < 0.272 && cy > -0.48) ||
+          (cx > -0.33 && cx < 0.1 && cy > -0.6)) {
+        nv = MAX_ITERS - 1;
+      } else {
+      ...
+```
+
+Tried this approach in Version 4 and 5 (starting with 2 regions in V3 adding more in V5) and here're the result:
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/kc7zt9u2o7i0hsljogs1.png)
+
+This trick has provided by far the best improvement! Yet it is still almost twice as slow as C# :(
+
+## Episode 10. Fighting the multi-threading overhead
+
+What caught my eye was the fact that multithreaded versions of C# performed worse. I decided to check the hypothesis and took the optimisations done in parallel version for far and run in in one main isolate (PV6):
+
+```
+Avg: 62.5ms, StdDev: 2.2940%, SUM 78279528
+```
+
+Same effect in Dart, one thread/isolate performed better. What can be the reasons for that? Let me speculate and list a few: thread context switching (Dart isolates are backed by OS threads), marshalling and data handover costs, delays/stutters happening when communicating between threads (returning result to main isolate) caused by VM environment.
+
+To check the above statements and seek for mitigations of overheads in the 7th parallel version I turned isolates back on, yet made a few changes:
+
+- I spawned only one isolate (instead of 2 before) and made part of the calculation happening in main isolate
+- I used `Isolate.exit()` when returning result from an isolate. [Supposedly](https://github.com/dart-lang/sdk/issues/47164) this API allows to skip byte copy and transfer reference to the object right away to the main isolate. One of the challenges is that now I have to spawn isolate each time I do the calculation, though spawning is outside of measurement scope.
+- I added delays between measurements via `await Future.delayed(Duration(milliseconds: 150));` seeking to give OS scheduler and Dart isolate API more time to do whatever might be require to clean-up in the background and mitigate stutters.
+
+And the results are quite interesting. Firstly it brought noticeable improvement to performance on Intel VM. At the same time this changes didn't see any improvement on Apple Silicon:
+```
+// PV6, Apple
+Avg: 48.0ms, StdDev: 0.0000%
+// PV7, Apple
+Avg: 47.5ms, StdDev: 10.5146%
+
+// PV6, Intel
+Avg: 62.5ms, StdDev: 2.2940%
+// PV7, Intel
+Avg: 56.6ms, StdDev: 15.1573%
+```
+
+It seems that I've taken everything out of cross-isolate communication, and yet there's a solid gap with C#:
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/wh296mxagpw4gdqymrl7.png)
+
+## Episode 11. One final push, please...
+
+Though I kept in my head the magical results achieved by skipping the well-known regions. I've made a quick estimate of how many `MAX_ITER` points are being automatically escaped and it gave ~40%. Apparently the rectangular regions were to rough and I could have a better approximation with circles! Time to put to use the math learned in school:
+
+![Circle equation](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/7n22qm727h3o4fik2a8o.png)
+
+I took Sketchup (who knew), copied their the image of Mandelbrot, draw 3 circles and that was I needed to get the right coordinates.
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/i2gbgnstu1h307mvni6d.png)
+
+Here's how those 3 circles look in code:
+
+```dart
+...
+      const r1 = 0.607 * 0.607;
+      const dx1 = 0.133;
+      const dy1 = 0.0386;
+
+      const r2 = 0.248 * 0.248;
+      const dx2 = 1.0;
+
+      const r3 = 0.343 * 0.343;
+      const dx3 = -0.0089;
+      const dy3 = 0.2634;
+
+      // Skipping calculation for known to be madelbrot area
+      if (cx > -0.75 &&
+              cx < 0.23 &&
+              ((cx + dx1) * (cx + dx1) + (cy + dy1) * (cy + dy1) < r1) ||
+          ((cx + dx2) * (cx + dx2) + cy * cy < r2) ||
+          (cx > 0.23 && (cx + dx3) * (cx + dx3) + (cy + dy3) * (cy + dy3) < r3))
+...
+```
+
+And here's the moment of truth... Will it be close to C#, will the gap be small enough to keep pressing on the approach?
+
+![Moment of truth](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/xkk8l9q4ktjrv3l27zm2.gif)
+
+
+-----------
+<center>And it's a WIN!!!!</center>
+-----------
+
+![Image description](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/uvvmy6c0ynwjk8h9ajcr.png)
+
+## Episode 12. Finale
+
+To this point I was completely lost in getting every millisecond by any means and at any cost. Some approaches (such as delays between measured calls) might be considered as cheating. The code produced is super ugly and I don't like it. Yet if I was paid on every microsecond saved that would be the way to go.
+
+Still, I had my concerns that the check some stopped being representative of algo correctness somewhere around parallel version 2. I decided to check what the set would look like when rendered. Created this [plot.py](https://github.com/maxim-saplin/mandelbrot/blob/main/_optimized/plot.py) script that took `result` array values from `output.txt` produced by [mandelbrot_parallel.dart](https://github.com/maxim-saplin/mandelbrot/blob/main/_optimized/mandelbrot_parallel.dart). And I expected to see something like this:
+
+![Broken Mandelbrot render](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/u6e2w7cnloonkkoqogdy.png)
+
+And I was relieved to get a mesmerising picture of Mandelbrot set:
+
+![Right Mandelbrot render](https://dev-to-uploads.s3.amazonaws.com/uploads/articles/m6i9bng0id2x71jwlfk2.png)
+
+On the topic of ugly code... I think it helped me to keep the lead from C#. There were versions 3 and 4 that used even more muscle with AVX512 and FMA instruction sets, pipelining and make the computation more efficient. The reached 26.5ms and 23.6ms but never surpassed Dart's result. My hypothesis is that ugly Dart code was not that easy to read and get the trick on well-known regions I employed (unlike the mirroring which was copied very soon).
+
+## Results table
+
+Single threaded mode table:
+
+| Version   | Intel AoT          | Intel JIT         | M1 Pro AoT        | M1 Pro JIT        |
+|-----------|--------------------|-------------------|-------------------|-------------------|
+| V1 Orig.  | 451.3ms (1.7%)     | 614.0ms (2.7%)    | 256.2ms (0.2%)    | 478.0ms (0.5%)    |
+| V2 No Comp| 295.6ms (1.0%)     | 298.3ms (2.0%)    | 251.3ms (0.3%)    | 251.1ms (0.3%)    |
+| V3 PreCx  | N/A              | 302.1ms (2.0%)     | N/A              | 256.3ms (0.6%)    |
+| V4 Loop   | N/A               | 303.5ms (3.3%)    | N/A              | 250.3ms (0.3%)    |
+| V5 SIMD   | 8806.0ms (4.5%)    | 162.9ms (7.6%)    | 4038.5ms (0.6%)   | 93.4ms (1.6%)     |
+
+Parallel mode table:
+
+| Version  | Intel AoT          | Intel JIT         | M1 Pro AoT        | M1 Pro JIT        |
+|----------|--------------------|-------------------|-------------------|-------------------|
+| V1        | 288.0ms (12.2%)    | 266.7ms (4.5%)    | N/A       | 145.7ms (1.2%)    |
+| V2 Prep  | 211.2ms (4.2%)     | 212.6ms (16.8%)   | 129.4ms (0.4%)     | 135.5ms (14.7%)   |
+| V3 Mirror | 149.4ms (6.7%)     | 169.5ms (18.1%)   | 111.5ms (0.5%)    | 116.6ms (14.6%)   |
+| V4 NoIter | 84.8ms (12.3%)     | 91.2ms (20.4%)    | 52.2ms (0.8%)     | 55.5ms (15.5%)    |
+| V5 MoreReg| 67.9ms (5.2%)      | 70.0ms (12.8%)    | 35.0ms (1.3%)     | 36.8ms (16.4%)    |
+| V6 NoIso | 62.5ms (2.3%)      | 69.3ms (16.0%)    | 48.0ms (0.0%)     | 48.5ms (3.3%)     |
+| V7 DelSlp | 56.6ms (15.2%)     | 57.2ms (10.2%)    | 47.5ms (10.5%)    | 51.3ms (12.0%)    |
+| V8 AproxCir| 19.2ms (14.3%)    | 25.3ms (18.1%)    | 23.5ms (15.7%)    | 24.0ms (18.7%)    |
