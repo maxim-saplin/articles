@@ -7,7 +7,7 @@ A story that started with [Flutter frame rates optimisations](https://dev.to/max
 - Finding out that [SIMD is broken in Dart](https://github.com/dart-lang/sdk/issues/53662). 
 - And achieving a **3200% speed-up** of what seemed to be already an efficient implementation.
 
-The story is almost a thriller. At one moment you think "that's it, I'm done, no way forward". And next you make a jump, adding 50, 100, 500%...
+There were many monents like "that's it, I'm done, no way forward". And next there's another jump, adding 50, 100, 500%...
 
 ## Episode 1. Mandelbrot in Dart
 
